@@ -1,4 +1,6 @@
 pub mod osc133;
+#[cfg(unix)]
+pub mod osc7;
 
 use std::path::PathBuf;
 
@@ -8,6 +10,14 @@ use clap::{Args, Subcommand, ValueEnum};
 pub enum Cmd {
     /// Print shell code to initialize atuin-hex on shell startup
     Init(Init),
+    /// Emit an OSC 7 sequence describing the current working directory.
+    ///
+    /// Designed to be called from per-prompt hooks in atuin hex's init scripts;
+    /// the daemon parses the emitted sequence and `chdir`s itself so that
+    /// terminals and multiplexers reading cwd via process introspection see
+    /// the inner shell's cwd instead of the daemon's startup directory.
+    #[cfg(unix)]
+    EmitOsc7,
 }
 
 /// Options for the top-level `atuin hex` command (when no subcommand is given).
@@ -61,8 +71,25 @@ pub fn run(cmd: Option<Cmd>, opts: RunOpts) {
                 std::process::exit(1);
             }
         }
+        #[cfg(unix)]
+        Some(Cmd::EmitOsc7) => {
+            if let Err(err) = emit_osc7() {
+                eprintln!("atuin hex: {err}");
+                std::process::exit(1);
+            }
+        }
         None => app::main(opts),
     }
+}
+
+/// Print `\e]7;file://<encoded-cwd>\e\\` for the current working directory.
+#[cfg(unix)]
+fn emit_osc7() -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("getcwd failed: {e}"))?;
+    let bytes = cwd.into_os_string().into_encoded_bytes();
+    let encoded = percent_encoding::percent_encode(&bytes, osc7::PATH_ENCODE_SET);
+    print!("\x1b]7;file://{encoded}\x1b\\");
+    Ok(())
 }
 
 fn detect_shell(cli_shell: Option<Shell>) -> Result<Shell, String> {
@@ -131,6 +158,28 @@ fn render_init(shell: Shell) -> &'static str {
 
   unset _atuin_hex_tmux_current _atuin_hex_tmux_previous
 fi
+
+# When running under atuin hex, emit OSC 7 (cwd) when $PWD changes so the
+# daemon can mirror our cwd.  All path encoding lives in `atuin hex
+# emit-osc7` (Rust) — there is no shell-side encoder.  We skip emission on
+# unchanged PWD (most prompts don't follow a `cd`) and detach the
+# subprocess so it doesn't block prompt rendering.
+if [[ -n "${ATUIN_HEX_SOCKET:-}" ]]; then
+  _atuin_hex_osc7() {
+    if [[ "$PWD" != "${_atuin_hex_last_pwd:-}" ]]; then
+      _atuin_hex_last_pwd="$PWD"
+      (atuin hex emit-osc7 &)
+    fi
+  }
+  if [[ -n "${BASH_VERSION:-}" ]]; then
+    if [[ "${PROMPT_COMMAND:-}" != *_atuin_hex_osc7* ]]; then
+      PROMPT_COMMAND="_atuin_hex_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+    fi
+  elif [[ -n "${ZSH_VERSION:-}" ]]; then
+    autoload -Uz add-zsh-hook
+    add-zsh-hook precmd _atuin_hex_osc7
+  fi
+fi
 "#
         }
         Shell::Fish => {
@@ -155,6 +204,19 @@ fi
         exec atuin hex --shell (status fish-path)
     end
 end
+
+# When running under atuin hex, emit OSC 7 (cwd) when $PWD changes so the
+# daemon can mirror our cwd.  All path encoding lives in `atuin hex
+# emit-osc7` (Rust) — there is no shell-side encoder.  --on-variable PWD
+# fires only on cd (not every prompt); the subprocess is detached so it
+# doesn't block.
+if set -q ATUIN_HEX_SOCKET
+    function __atuin_hex_osc7 --on-variable PWD
+        command atuin hex emit-osc7 &
+    end
+    # Initial emission so the daemon knows our cwd before the first cd.
+    command atuin hex emit-osc7 &
+end
 "#
         }
         // Nushell cannot dynamically source the output of `atuin init nu`,
@@ -170,6 +232,23 @@ end
         $env.ATUIN_HEX_TMUX = $tmux_current
         exec atuin hex --shell $nu.current-exe
     }
+}
+
+# When running under atuin hex, emit OSC 7 (cwd) when $env.PWD changes so
+# the daemon can mirror our cwd.  All path encoding lives in `atuin hex
+# emit-osc7` (Rust) — there is no shell-side encoder.  The env_change.PWD
+# hook fires only on cd (not every prompt); `job spawn` runs the
+# subprocess asynchronously so it doesn't block.
+if not ($env.ATUIN_HEX_SOCKET? | default "" | is-empty) {
+    let _atuin_hex_osc7 = {|_before, _after|
+        job spawn { ^atuin hex emit-osc7 } | ignore
+    }
+    $env.config.hooks.env_change.PWD = (
+        ($env.config.hooks.env_change.PWD? | default []) | append $_atuin_hex_osc7
+    )
+    # Nushell auto-fires env_change.PWD on shell startup
+    # (before="" -> after=$PWD), so the daemon learns our cwd without a
+    # manual initial fire here.
 }
 "#
         }
@@ -381,10 +460,11 @@ mod app {
 
         terminal::enable_raw_mode()?;
 
-        // PTY -> stdout (with OSC 133 parsing + buffer feed)
+        // PTY -> stdout (with OSC 133 + OSC 7 parsing + buffer feed)
         let stdout_thread = std::thread::spawn(move || {
             let mut stdout = std::io::stdout();
             let mut parser = crate::osc133::Parser::new();
+            let mut osc7 = crate::osc7::Parser::new();
             let mut buf = [0u8; 8192];
             loop {
                 match pty_reader.read(&mut buf) {
@@ -393,6 +473,17 @@ mod app {
                         parser.push(&buf[..n], |_event| {
                             // Zone transitions are tracked inside the parser.
                             // Callers can query parser.zone() after push.
+                        });
+
+                        // Mirror the inner shell's cwd onto our own process so
+                        // terminals/multiplexers reading our cwd via process
+                        // introspection (e.g. tmux pane_current_path) see
+                        // where the shell actually is.  set_current_dir
+                        // silently fails for non-existent paths (e.g. an
+                        // OSC 7 forwarded from an SSH'd remote session),
+                        // which is the desired behavior.
+                        osc7.push(&buf[..n], |event| {
+                            let _ = std::env::set_current_dir(&event.path);
                         });
 
                         // Feed bytes to the shadow parser. Drops on backpressure —

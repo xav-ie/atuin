@@ -12,6 +12,7 @@ repository = { workspace = true }
 
 [dependencies]
 clap = { workspace = true }
+percent-encoding = "2.3"
 
 [target.'cfg(unix)'.dependencies]
 crossterm = { workspace = true }
